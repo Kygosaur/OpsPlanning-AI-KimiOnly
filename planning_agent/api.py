@@ -9,16 +9,20 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import AsyncIterator, Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from .llm import answer_workspace_question
+from .data import load_workbook
+from .database import PlanningDatabase
+from .llm import answer_workspace_question, understand_request
 from .local_llm import LocalLLM
 from .rag import Passage, WorkspaceIndex
+from .scheduler import OptimizationOptions, create_schedule
+from .security import Principal, configure_auth, current_principal, issue_token, require_roles, verify_password
 
 
 load_dotenv()
@@ -34,12 +38,28 @@ class ChatRequest(BaseModel):
     history: list[HistoryItem] = Field(default_factory=list, max_length=8)
 
 
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=100)
+    password: str = Field(min_length=1, max_length=500)
+
+
+class ScheduleRequest(BaseModel):
+    request: str = Field(min_length=1, max_length=8_000)
+    max_solver_seconds: float = Field(default=30.0, gt=0, le=300)
+
+
+class ReviewRequest(BaseModel):
+    decision: Literal["approved", "rejected"]
+    comment: str = Field(default="", max_length=2_000)
+
+
 class AppState:
     index: WorkspaceIndex | None = None
     client: LocalLLM | None = None
     indexed_at: float | None = None
     chunk_count: int = 0
     lock = asyncio.Lock()
+    database: PlanningDatabase | None = None
 
 
 state = AppState()
@@ -65,6 +85,8 @@ async def _build_index() -> None:
 async def lifespan(_: FastAPI):
     _, llm_url, model = _settings()
     state.client = LocalLLM(llm_url, model)
+    state.database = PlanningDatabase(os.getenv("PLANNING_DATABASE", "data/planning_history.db"))
+    configure_auth(state.database)
     await _build_index()
     yield
 
@@ -84,11 +106,16 @@ async def status() -> dict[str, object]:
         "indexed_at": state.indexed_at,
         "skipped": len(state.index.skipped) if state.index else 0,
         "privacy": "loopback-only",
+        "retrieval": "hybrid-bm25-dense-reranked" if state.index and state.index.semantic_ready else "bm25-fallback",
+        "semantic_ready": bool(state.index and state.index.semantic_ready),
+        "semantic_error": state.index.semantic_error if state.index else None,
+        "optimizer": "OR-Tools CP-SAT",
+        "authentication_enabled": os.getenv("AUTH_ENABLED", "false").casefold() == "true",
     }
 
 
 @app.post("/api/reindex")
-async def reindex() -> dict[str, object]:
+async def reindex(_: Principal = Depends(require_roles("admin", "planner"))) -> dict[str, object]:
     if state.lock.locked():
         raise HTTPException(409, "Indexing is already in progress")
     async with state.lock:
@@ -98,13 +125,74 @@ async def reindex() -> dict[str, object]:
 
 
 @app.post("/api/chat/stream")
-async def chat_stream(request: ChatRequest) -> StreamingResponse:
+async def chat_stream(request: ChatRequest, principal: Principal = Depends(current_principal)) -> StreamingResponse:
     if state.index is None or state.client is None:
         raise HTTPException(503, "Assistant is still starting")
+    if state.database:
+        state.database.audit(principal.username, "CHAT_QUESTION", "workspace", None, {"question_length": len(request.question)})
     return StreamingResponse(_event_stream(request), media_type="text/event-stream", headers={
         "Cache-Control": "no-cache, no-transform",
         "X-Accel-Buffering": "no",
     })
+
+
+@app.post("/api/auth/login")
+async def login(request: LoginRequest) -> dict[str, object]:
+    if os.getenv("AUTH_ENABLED", "false").casefold() != "true":
+        return {"token": "local-auth-disabled", "username": "local-user", "role": "admin"}
+    if state.database is None:
+        raise HTTPException(503, "Database is not ready")
+    user = state.database.get_user(request.username)
+    if user is None or not verify_password(request.password, user["password_hash"]):
+        state.database.audit(request.username, "LOGIN_FAILED", "user", request.username, {})
+        raise HTTPException(401, "Invalid username or password")
+    principal = Principal(user["username"], user["role"])
+    token = issue_token(principal, os.environ["APP_SECRET_KEY"])
+    state.database.audit(principal.username, "LOGIN_SUCCESS", "user", principal.username, {})
+    return {"token": token, "username": principal.username, "role": principal.role}
+
+
+@app.get("/api/auth/me")
+async def me(principal: Principal = Depends(current_principal)) -> dict[str, str]:
+    return {"username": principal.username, "role": principal.role}
+
+
+@app.post("/api/schedules")
+async def optimize_schedule(request: ScheduleRequest, principal: Principal = Depends(require_roles("admin", "planner"))) -> dict[str, object]:
+    if state.client is None or state.database is None:
+        raise HTTPException(503, "Application is still starting")
+    workbook = Path(os.getenv("PLANNING_WORKBOOK", "data/planning.xlsx")).resolve()
+    if not workbook.is_file():
+        raise HTTPException(404, f"Planning workbook not found: {workbook.name}")
+    try:
+        parsed = await asyncio.to_thread(understand_request, state.client, request.request)
+        workers, tasks, machines, vehicles = await asyncio.to_thread(load_workbook, workbook)
+        result = await asyncio.to_thread(
+            create_schedule, workers, tasks, machines, vehicles, parsed,
+            OptimizationOptions(max_time_seconds=request.max_solver_seconds),
+        )
+        identifier = state.database.create_schedule(request.request, result.to_dict(), principal.username)
+        return {"id": identifier, "approval_status": "draft", "schedule": result.to_dict()}
+    except (ValueError, FileNotFoundError) as error:
+        raise HTTPException(422, str(error)) from error
+
+
+@app.get("/api/schedules")
+async def schedule_history(principal: Principal = Depends(current_principal)) -> list[dict[str, object]]:
+    if state.database is None:
+        raise HTTPException(503, "Database is not ready")
+    return state.database.list_schedules()
+
+
+@app.post("/api/schedules/{identifier}/review")
+async def review_schedule(identifier: str, request: ReviewRequest, principal: Principal = Depends(require_roles("admin", "planner"))) -> dict[str, str]:
+    if state.database is None:
+        raise HTTPException(503, "Database is not ready")
+    try:
+        state.database.review_schedule(identifier, request.decision, principal.username, request.comment)
+    except KeyError as error:
+        raise HTTPException(404, str(error)) from error
+    return {"id": identifier, "status": request.decision}
 
 
 async def _event_stream(request: ChatRequest) -> AsyncIterator[str]:

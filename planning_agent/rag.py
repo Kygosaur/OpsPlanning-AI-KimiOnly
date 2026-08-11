@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+import numpy as np
 import pandas as pd
 from docx import Document
 from pypdf import PdfReader
+
+from .terminology import expand_terminology
 
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_\-]{2,}")
@@ -29,28 +33,33 @@ class Passage:
 @dataclass(frozen=True)
 class _Chunk:
     text: str
+    retrieval_text: str
     document: str
     location: str
     terms: Counter[str]
 
 
 class WorkspaceIndex:
-    """Read-only, lexical workspace search with no network or embedding service."""
+    """Local hybrid BM25 + dense retrieval with cross-encoder reranking."""
 
-    def __init__(self, root: str | Path, *, max_file_bytes: int = 5_000_000):
+    def __init__(self, root: str | Path, *, max_file_bytes: int = 5_000_000, enable_semantic: bool | None = None):
         self.root = Path(root).resolve(strict=True)
         if not self.root.is_dir():
             raise ValueError(f"Workspace is not a directory: {self.root}")
         self.max_file_bytes = max_file_bytes
+        self.enable_semantic = (os.getenv("RETRIEVAL_ENABLE_SEMANTIC", "true").casefold() == "true") if enable_semantic is None else enable_semantic
         self._chunks: list[_Chunk] = []
-        self._postings: dict[str, list[tuple[int, float]]] = {}
-        self._idf: dict[str, float] = {}
+        self._document_frequency: Counter[str] = Counter()
+        self._average_length = 0.0
+        self._dense_matrix: np.ndarray | None = None
+        self._embedding_model = None
+        self._reranker = None
+        self.semantic_ready = False
+        self.semantic_error: str | None = None
         self.skipped: list[str] = []
 
     def build(self) -> int:
         self._chunks.clear()
-        self._postings.clear()
-        self._idf.clear()
         self.skipped.clear()
         for path in self.root.rglob("*"):
             if not self._allowed(path):
@@ -58,45 +67,97 @@ class WorkspaceIndex:
             try:
                 for text, location in _extract(path):
                     for chunk in _chunk_text(text):
-                        terms = Counter(_tokens(chunk))
+                        retrieval_text = expand_terminology(chunk)
+                        terms = Counter(_tokens(retrieval_text))
                         if terms:
                             relative = str(path.relative_to(self.root))
-                            self._chunks.append(_Chunk(chunk, relative, location, terms))
+                            self._chunks.append(_Chunk(chunk, retrieval_text, relative, location, terms))
             except Exception as error:
                 self.skipped.append(f"{path.name}: {type(error).__name__}")
-        self._prepare_search()
+        self._prepare_bm25()
+        if self.enable_semantic and self._chunks:
+            self._prepare_semantic()
         return len(self._chunks)
 
-    def search(self, question: str, top_k: int = 5, minimum_score: float = 0.05) -> list[Passage]:
-        query = Counter(_tokens(question))
-        if not query or not self._chunks:
+    def search(self, question: str, top_k: int = 5, minimum_score: float = 0.02) -> list[Passage]:
+        if not question.strip() or not self._chunks:
             return []
-        query_vector = {term: frequency * self._idf.get(term, 0.0) for term, frequency in query.items()}
-        query_norm = math.sqrt(sum(value * value for value in query_vector.values()))
-        if not query_norm:
+        normalized_query = expand_terminology(question)
+        candidate_limit = min(len(self._chunks), max(top_k * 4, 12))
+        bm25 = self._bm25_scores(normalized_query)
+        lexical_order = np.argsort(bm25)[::-1][:candidate_limit]
+        candidate_ids = set(int(index) for index in lexical_order if bm25[index] > 0)
+        dense = np.zeros(len(self._chunks), dtype=np.float32)
+        if self.semantic_ready and self._dense_matrix is not None:
+            query_vector = np.asarray(list(self._embedding_model.query_embed([normalized_query]))[0], dtype=np.float32)
+            query_vector /= max(float(np.linalg.norm(query_vector)), 1e-12)
+            dense = self._dense_matrix @ query_vector
+            candidate_ids.update(int(index) for index in np.argsort(dense)[::-1][:candidate_limit])
+        if not candidate_ids:
             return []
-        scores: Counter[int] = Counter()
-        for term, query_weight in query_vector.items():
-            for chunk_index, normalized_weight in self._postings.get(term, []):
-                scores[chunk_index] += (query_weight / query_norm) * normalized_weight
-        scored: list[Passage] = []
-        for chunk_index, score in scores.items():
-            if score >= minimum_score:
-                chunk = self._chunks[chunk_index]
-                scored.append(Passage(chunk.text, chunk.document, chunk.location, score))
-        return sorted(scored, key=lambda item: item.score, reverse=True)[:top_k]
 
-    def _prepare_search(self) -> None:
-        count = len(self._chunks)
-        frequency = Counter(term for chunk in self._chunks for term in chunk.terms)
-        self._idf = {term: math.log((count + 1) / (value + 1)) + 1 for term, value in frequency.items()}
-        for index, chunk in enumerate(self._chunks):
-            vector = {term: value * self._idf[term] for term, value in chunk.terms.items()}
-            norm = math.sqrt(sum(value * value for value in vector.values()))
-            if not norm:
+        # Reciprocal-rank fusion avoids incompatible BM25 and cosine score scales.
+        fused: Counter[int] = Counter()
+        for rank, index in enumerate(np.argsort(bm25)[::-1][:candidate_limit]):
+            if bm25[index] > 0:
+                fused[int(index)] += 1.0 / (60 + rank + 1)
+        if self.semantic_ready:
+            for rank, index in enumerate(np.argsort(dense)[::-1][:candidate_limit]):
+                fused[int(index)] += 1.0 / (60 + rank + 1)
+        ordered = sorted(candidate_ids, key=lambda index: fused[index], reverse=True)[:candidate_limit]
+
+        if self.semantic_ready and self._reranker is not None:
+            raw_scores = list(self._reranker.rerank(normalized_query, [self._chunks[index].retrieval_text for index in ordered]))
+            final = [(index, _sigmoid(float(score))) for index, score in zip(ordered, raw_scores)]
+        else:
+            peak = max((fused[index] for index in ordered), default=1.0)
+            final = [(index, fused[index] / peak) for index in ordered]
+        results = []
+        for index, score in sorted(final, key=lambda item: item[1], reverse=True):
+            if score < minimum_score:
                 continue
-            for term, value in vector.items():
-                self._postings.setdefault(term, []).append((index, value / norm))
+            chunk = self._chunks[index]
+            results.append(Passage(chunk.text, chunk.document, chunk.location, round(score, 6)))
+            if len(results) >= top_k:
+                break
+        return results
+
+    def _prepare_bm25(self) -> None:
+        self._document_frequency = Counter(term for chunk in self._chunks for term in chunk.terms)
+        self._average_length = sum(sum(chunk.terms.values()) for chunk in self._chunks) / len(self._chunks) if self._chunks else 0.0
+
+    def _bm25_scores(self, question: str, k1: float = 1.5, b: float = 0.75) -> np.ndarray:
+        query_terms = Counter(_tokens(question))
+        count = len(self._chunks)
+        scores = np.zeros(count, dtype=np.float32)
+        for index, chunk in enumerate(self._chunks):
+            length = sum(chunk.terms.values())
+            for term, query_frequency in query_terms.items():
+                frequency = chunk.terms.get(term, 0)
+                if not frequency:
+                    continue
+                document_frequency = self._document_frequency[term]
+                idf = math.log(1 + (count - document_frequency + 0.5) / (document_frequency + 0.5))
+                denominator = frequency + k1 * (1 - b + b * length / max(self._average_length, 1.0))
+                scores[index] += query_frequency * idf * (frequency * (k1 + 1) / denominator)
+        return scores
+
+    def _prepare_semantic(self) -> None:
+        try:
+            from fastembed import TextEmbedding
+            from fastembed.rerank.cross_encoder import TextCrossEncoder
+
+            local_only = os.getenv("RETRIEVAL_LOCAL_FILES_ONLY", "true").casefold() == "true"
+            self._embedding_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5", local_files_only=local_only)
+            self._reranker = TextCrossEncoder(model_name="Xenova/ms-marco-MiniLM-L-6-v2", local_files_only=local_only)
+            matrix = np.asarray(list(self._embedding_model.passage_embed([chunk.retrieval_text for chunk in self._chunks])), dtype=np.float32)
+            norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+            self._dense_matrix = matrix / np.maximum(norms, 1e-12)
+            self.semantic_ready = True
+            self.semantic_error = None
+        except Exception as error:
+            self.semantic_ready = False
+            self.semantic_error = f"{type(error).__name__}: {error}"
 
     def _allowed(self, path: Path) -> bool:
         try:
@@ -150,3 +211,8 @@ def _tokens(text: str) -> list[str]:
     return [token.casefold() for token in TOKEN_RE.findall(text)]
 
 
+def _sigmoid(value: float) -> float:
+    if value >= 0:
+        return 1 / (1 + math.exp(-value))
+    exponential = math.exp(value)
+    return exponential / (1 + exponential)
