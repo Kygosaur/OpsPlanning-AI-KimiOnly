@@ -53,7 +53,13 @@ button { cursor: pointer; }
 .message-body pre { overflow: auto; padding: 12px; border-radius: 10px; background: #17221c; color: #eef5eb; }
 .sources { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; margin-top: 10px; color: #788278; font-size: 9px; font-weight: 700; text-transform: uppercase; }
 .source-pill { padding: 6px 9px; border: 1px solid #d8dcd3; border-radius: 99px; background: #edf0e9; color: #566457; font-size: 9px; text-transform: none; }
-.timing { margin-top: 9px; color: #788278; font-size: 10px; }
+.schedule-card { margin-top: 12px; overflow: hidden; border: 1px solid #d6dbd1; border-radius: 15px; background: #f9faf6; }
+.metadata-heading { display: flex; justify-content: space-between; align-items: center; padding: 13px 15px; border-bottom: 1px solid #e0e3dc; font-size: 12px; }.metadata-heading span { padding: 4px 8px; border-radius: 99px; color: #765b22; background: #f7ebc8; font-size: 9px; font-weight: 800; text-transform: uppercase; }
+.schedule-task { display: flex; justify-content: space-between; gap: 16px; padding: 11px 15px; border-bottom: 1px solid #e8eae4; }.schedule-task strong,.schedule-task span { display: block; }.schedule-task strong { font-size: 12px; }.schedule-task span,.schedule-task small { margin-top: 3px; color: #707a71; font-size: 10px; }
+.schedule-summary { display: flex; flex-wrap: wrap; gap: 16px; padding: 11px 15px; color: #707a71; font-size: 9px; text-transform: uppercase; }.schedule-summary strong { color: #344238; }
+.warnings { display: grid; gap: 4px; margin-top: 10px; padding: 10px 12px; border-left: 3px solid #c68b4f; color: #744c2b; background: #fff5e9; font-size: 10px; }.warnings strong { text-transform: uppercase; }
+.intent-row { margin-top: 9px; color: #7b847c; font-size: 9px; text-transform: uppercase; }
+.timing { margin-top: 7px; color: #788278; font-size: 10px; }.timing summary { cursor: pointer; }.timing div { display: flex; flex-wrap: wrap; gap: 5px 12px; margin-top: 6px; text-transform: capitalize; }
 .thinking-card { display: flex; align-items: center; gap: 15px; width: fit-content; padding: 15px 18px; border: 1px solid #dcded6; border-radius: 16px; background: #faf9f5; }
 .thinking-card strong, .thinking-card span { display: block; }.thinking-card strong { font-size: 12px; }.thinking-card span { margin-top: 3px; color: #7d867e; font-size: 10px; }
 .thinking-dots { display: flex; gap: 3px; }.thinking-dots i { width: 5px; height: 5px; border-radius: 50%; background: #779b6b; animation: pulse 1.2s infinite; }.thinking-dots i:nth-child(2){animation-delay:.15s}.thinking-dots i:nth-child(3){animation-delay:.3s}

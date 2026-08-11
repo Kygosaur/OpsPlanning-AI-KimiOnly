@@ -5,7 +5,6 @@ import json
 import os
 import time
 from contextlib import asynccontextmanager
-from dataclasses import asdict
 from pathlib import Path
 from typing import AsyncIterator, Literal
 
@@ -18,9 +17,11 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .data import load_workbook
 from .database import PlanningDatabase
-from .llm import answer_workspace_question, understand_request
+from .intent import IntentDecision, route_request
+from .llm import answer_general_question, answer_workspace_question, explain_schedule, understand_request
 from .local_llm import LocalLLM
 from .rag import Passage, WorkspaceIndex
+from .responses import compose_response, source_payload
 from .scheduler import OptimizationOptions, create_schedule
 from .security import Principal, configure_auth, current_principal, issue_token, require_roles, verify_password
 
@@ -130,7 +131,7 @@ async def chat_stream(request: ChatRequest, principal: Principal = Depends(curre
         raise HTTPException(503, "Assistant is still starting")
     if state.database:
         state.database.audit(principal.username, "CHAT_QUESTION", "workspace", None, {"question_length": len(request.question)})
-    return StreamingResponse(_event_stream(request), media_type="text/event-stream", headers={
+    return StreamingResponse(_event_stream(request, principal), media_type="text/event-stream", headers={
         "Cache-Control": "no-cache, no-transform",
         "X-Accel-Buffering": "no",
     })
@@ -165,14 +166,26 @@ async def optimize_schedule(request: ScheduleRequest, principal: Principal = Dep
     if not workbook.is_file():
         raise HTTPException(404, f"Planning workbook not found: {workbook.name}")
     try:
+        started = time.perf_counter()
+        constraint_started = time.perf_counter()
         parsed = await asyncio.to_thread(understand_request, state.client, request.request)
+        constraint_seconds = time.perf_counter() - constraint_started
         workers, tasks, machines, vehicles = await asyncio.to_thread(load_workbook, workbook)
+        solver_started = time.perf_counter()
         result = await asyncio.to_thread(
             create_schedule, workers, tasks, machines, vehicles, parsed,
             OptimizationOptions(max_time_seconds=request.max_solver_seconds),
         )
+        solver_seconds = time.perf_counter() - solver_started
         identifier = state.database.create_schedule(request.request, result.to_dict(), principal.username)
-        return {"id": identifier, "approval_status": "draft", "schedule": result.to_dict()}
+        response = compose_response(
+            "Schedule created successfully. It is a draft until a supervisor approves it.",
+            IntentDecision(planning=True, method="schedule-endpoint"), [],
+            {"constraint_parser_seconds": round(constraint_seconds, 3), "solver_seconds": round(solver_seconds, 3)},
+            result, identifier,
+        )
+        response["timing"]["total_seconds"] = round(time.perf_counter() - started, 3)
+        return response
     except (ValueError, FileNotFoundError) as error:
         raise HTTPException(422, str(error)) from error
 
@@ -195,20 +208,53 @@ async def review_schedule(identifier: str, request: ReviewRequest, principal: Pr
     return {"id": identifier, "status": request.decision}
 
 
-async def _event_stream(request: ChatRequest) -> AsyncIterator[str]:
+async def _event_stream(request: ChatRequest, principal: Principal) -> AsyncIterator[str]:
     started = time.perf_counter()
-    yield _sse("status", {"stage": "searching", "message": "Searching local files"})
-    passages = await asyncio.to_thread(state.index.search, request.question, 5, 0.04)  # type: ignore[union-attr]
-    yield _sse("sources", {"items": [_source(p) for p in passages]})
-    yield _sse("status", {"stage": "thinking", "message": "Kimi is preparing the answer"})
-    task = asyncio.create_task(asyncio.to_thread(
-        answer_workspace_question,
-        state.client,
-        request.question,
-        passages,
-        [item.model_dump() for item in request.history],
-    ))
     try:
+        timings: dict[str, float] = {}
+        yield _sse("status", {"stage": "routing", "message": "Understanding the request"})
+        mark = time.perf_counter()
+        intents = await asyncio.to_thread(route_request, state.client, request.question)  # type: ignore[arg-type]
+        timings["routing_seconds"] = round(time.perf_counter() - mark, 3)
+        yield _sse("intent", intents.to_dict())
+
+        passages: list[Passage] = []
+        if intents.rag:
+            yield _sse("status", {"stage": "searching", "message": "Searching approved local files"})
+            mark = time.perf_counter()
+            passages = await asyncio.to_thread(state.index.search, request.question, 5, 0.04)  # type: ignore[union-attr]
+            timings["retrieval_seconds"] = round(time.perf_counter() - mark, 3)
+            yield _sse("sources", {"items": [source_payload(p) for p in passages]})
+
+        schedule = None
+        schedule_id = None
+        if intents.planning:
+            if principal.role not in {"admin", "planner"}:
+                raise PermissionError("Planning requires the planner or admin role.")
+            workbook = Path(os.getenv("PLANNING_WORKBOOK", "data/planning.xlsx")).resolve()
+            if not workbook.is_file():
+                raise FileNotFoundError(f"Planning workbook not found: {workbook.name}")
+            yield _sse("status", {"stage": "parsing", "message": "Parsing planning constraints"})
+            mark = time.perf_counter()
+            parsed = await asyncio.to_thread(understand_request, state.client, request.question)  # type: ignore[arg-type]
+            workers, tasks, machines, vehicles = await asyncio.to_thread(load_workbook, workbook)
+            timings["constraint_parser_seconds"] = round(time.perf_counter() - mark, 3)
+            yield _sse("status", {"stage": "optimizing", "message": "Optimizing the draft schedule"})
+            mark = time.perf_counter()
+            schedule = await asyncio.to_thread(create_schedule, workers, tasks, machines, vehicles, parsed)
+            timings["solver_seconds"] = round(time.perf_counter() - mark, 3)
+            schedule_id = state.database.create_schedule(request.question, schedule.to_dict(), principal.username)  # type: ignore[union-attr]
+
+        yield _sse("status", {"stage": "thinking", "message": "Kimi is composing the response"})
+        mark = time.perf_counter()
+        history = [item.model_dump() for item in request.history]
+        if schedule is not None:
+            call = (explain_schedule, state.client, request.question, schedule, passages)
+        elif intents.rag:
+            call = (answer_workspace_question, state.client, request.question, passages, history)
+        else:
+            call = (answer_general_question, state.client, request.question, history)
+        task = asyncio.create_task(asyncio.to_thread(*call))
         while not task.done():
             elapsed = time.perf_counter() - started
             timeout = 1.0 if elapsed >= 9.0 else min(9.0 - elapsed, 1.0)
@@ -218,19 +264,19 @@ async def _event_stream(request: ChatRequest) -> AsyncIterator[str]:
                 if elapsed >= 9.0:
                     yield _sse("progress", {"elapsed_seconds": int(time.perf_counter() - started)})
         answer = await task
+        timings["llm_seconds"] = round(time.perf_counter() - mark, 3)
         elapsed = time.perf_counter() - started
-        yield _sse("complete", {
-            "answer": answer,
-            "elapsed_seconds": round(elapsed, 2),
-            "show_timing": elapsed >= 10.0,
-            "sources": [_source(p) for p in passages],
-        })
+        response = compose_response(answer, intents, passages, timings, schedule, schedule_id)
+        response["timing"]["total_seconds"] = round(elapsed, 3)
+        response["elapsed_seconds"] = round(elapsed, 2)
+        response["show_timing"] = elapsed >= 10.0
+        if state.database:
+            state.database.audit(principal.username, "CHAT_COMPLETED", "workspace", schedule_id, {
+                "intents": intents.to_dict(), "source_count": len(passages), "elapsed_seconds": round(elapsed, 3),
+            })
+        yield _sse("complete", response)
     except Exception as error:
         yield _sse("error", {"message": str(error), "elapsed_seconds": round(time.perf_counter() - started, 2)})
-
-
-def _source(passage: Passage) -> dict[str, object]:
-    return {"document": passage.document, "location": passage.location, "score": round(passage.score, 3)}
 
 
 def _sse(event: str, data: dict[str, object]) -> str:

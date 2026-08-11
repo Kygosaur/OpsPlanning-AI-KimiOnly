@@ -2,7 +2,11 @@ import { FormEvent, KeyboardEvent, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 
 type Source = { document: string; location: string; score: number };
-type Message = { id: string; role: "user" | "assistant"; content: string; sources?: Source[]; elapsed?: number };
+type Intent = { general: boolean; rag: boolean; planning: boolean; method?: string };
+type ScheduleTask = { task: string; start_time?: string; end_time?: string; workers: string[]; machine: string; vehicle?: string };
+type ScheduleMeta = { id?: string; tasks: ScheduleTask[]; solver_status: string; makespan_hours: number; approval_status: string };
+type Timing = Record<string, number>;
+type Message = { id: string; role: "user" | "assistant"; content: string; sources?: Source[]; warnings?: string[]; intents?: Intent; schedule?: ScheduleMeta; timing?: Timing };
 type Status = { ready: boolean; model: string; workspace: string; chunks: number; skipped: number; privacy: string };
 
 const suggestions = [
@@ -74,7 +78,8 @@ export default function App() {
         if (event === "complete") {
           setMessages(current => [...current, {
             id: crypto.randomUUID(), role: "assistant", content: data.answer as string,
-            sources: data.sources as Source[], elapsed: data.show_timing ? data.elapsed_seconds as number : undefined,
+            sources: data.sources as Source[], warnings: data.warnings as string[], intents: data.intents as Intent,
+            schedule: data.schedule as ScheduleMeta | undefined, timing: data.timing as Timing,
           }]);
           setStage("");
         }
@@ -140,10 +145,26 @@ export default function App() {
             <article className={`message ${message.role}`} key={message.id}>
               <div className="message-label">{message.role === "user" ? "You" : "Kimi · local"}</div>
               <div className="message-body"><ReactMarkdown>{message.content}</ReactMarkdown></div>
+              {message.schedule && <section className="schedule-card">
+                <div className="metadata-heading"><strong>Draft schedule</strong><span>{message.schedule.approval_status}</span></div>
+                {message.schedule.tasks.map(task => <div className="schedule-task" key={task.task}>
+                  <div><strong>{task.task}</strong><span>{task.start_time ?? "Start pending"} – {task.end_time ?? "End pending"}</span></div>
+                  <small>{task.workers.join(", ")} · {task.machine}{task.vehicle ? ` · ${task.vehicle}` : ""}</small>
+                </div>)}
+                <div className="schedule-summary">
+                  <span>Solver <strong>{message.schedule.solver_status}</strong></span>
+                  <span>Makespan <strong>{message.schedule.makespan_hours}h</strong></span>
+                  <span>Approval <strong>{message.schedule.approval_status}</strong></span>
+                </div>
+              </section>}
               {message.sources && message.sources.length > 0 && <div className="sources">
                 <span>Sources</span>{message.sources.map((source, index) => <span className="source-pill" key={`${source.document}-${source.location}-${index}`}>{source.document} · {source.location}</span>)}
               </div>}
-              {message.elapsed !== undefined && <div className="timing">Completed in {message.elapsed.toFixed(1)} seconds</div>}
+              {message.warnings && message.warnings.length > 0 && <div className="warnings"><strong>Warnings</strong>{message.warnings.map(item => <span key={item}>{item}</span>)}</div>}
+              {message.intents && <div className="intent-row">Routes: {(["general", "rag", "planning"] as const).filter(key => message.intents?.[key]).join(" + ")}</div>}
+              {message.timing && <details className="timing"><summary>Completed in {message.timing.total_seconds.toFixed(1)} seconds</summary>
+                <div>{Object.entries(message.timing).filter(([key]) => key !== "total_seconds").map(([key, value]) => <span key={key}>{key.replaceAll("_", " ")}: {value.toFixed(2)}s</span>)}</div>
+              </details>}
             </article>
           ))}
           {busy && <div className="thinking-card"><div className="thinking-dots"><i/><i/><i/></div><div><strong>{stage}</strong><span>{elapsed >= 10 ? `Still working · ${elapsed}s elapsed` : "Working entirely on this machine"}</span></div></div>}

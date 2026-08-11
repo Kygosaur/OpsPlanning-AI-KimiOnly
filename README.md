@@ -37,6 +37,19 @@ Planning Agent
             SQLite database
 ```
 
+The intent router returns non-exclusive flags. A request can use RAG and
+planning together:
+
+```json
+{"general": false, "rag": true, "planning": true}
+```
+
+Each completed request uses one response contract containing `answer`,
+`sources`, `warnings`, `intents`, optional `schedule`, and per-stage `timing`.
+Schedule metadata includes solver status, makespan, and approval status. This
+lets the React interface render reliable structured results without extracting
+facts from Kimi's prose.
+
 `Ollama` is the local model runtime. It loads Kimi onto the GPU and provides an
 API at `127.0.0.1:11434`. This is a process on the same PC, not a remote server.
 FastAPI sends the user's question and only the most relevant local excerpts to

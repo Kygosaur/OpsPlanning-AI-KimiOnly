@@ -66,6 +66,17 @@ def answer_workspace_question(client: LocalLLM, question: str, passages: list[Pa
     return answer
 
 
+def answer_general_question(client: LocalLLM, question: str, history: list[dict[str, str]] | None = None) -> str:
+    messages = [{"role": "system", "content": (
+        "You are a helpful private assistant running locally. Answer ordinary conversation and general "
+        "questions clearly. Do not claim to know company facts or files, do not invent company policy, "
+        "and direct requests requiring workspace evidence to the document-search path."
+    )}]
+    messages.extend((history or [])[-6:])
+    messages.append({"role": "user", "content": question})
+    return client.chat(messages)
+
+
 def _json_object(text: str) -> str:
     fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     if fenced:
