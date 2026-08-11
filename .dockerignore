@@ -1,0 +1,10 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.py[cod]
+.env
+outputs
+documents/*.pdf
+data/*.xlsx
+
