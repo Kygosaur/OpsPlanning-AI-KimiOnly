@@ -26,6 +26,14 @@ class WorkspaceIndexTests(unittest.TestCase):
             index.build()
             self.assertEqual(index.search("CNC maintenance")[0].document, "machines.txt")
 
+    def test_editable_terminology_expansion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "safety.txt").write_text("Protective headgear is mandatory personal protective equipment.", encoding="utf-8")
+            index = WorkspaceIndex(root, enable_semantic=False)
+            index.build()
+            self.assertEqual(index.search("Is a helmet PPE?")[0].document, "safety.txt")
+
 
 if __name__ == "__main__":
     unittest.main()
