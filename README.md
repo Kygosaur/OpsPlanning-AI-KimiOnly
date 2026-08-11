@@ -21,21 +21,53 @@ saved as a draft for human approval.
 
 ## How the local system works
 
-```text
-Browser at 127.0.0.1:8000
-          |
-          v
-React
-  |
-FastAPI
-  |
-Planning Agent
-  |-- Kimi -------- Ollama (local GPU)
-  |-- RAG --------- Documents / Excel
-  `-- Optimizer --- OR-Tools CP-SAT
-           \          /
-            SQLite database
+```mermaid
+flowchart TD
+    U["User: question or planning request"] --> UI["React chat UI"]
+    UI --> API["FastAPI backend"]
+    API --> AUTH["Optional authentication + audit log"]
+    AUTH --> ROUTER["Intent router — local Kimi"]
+
+    ROUTER -->|general = true| GENERAL["General chat — local Kimi"]
+    ROUTER -->|rag = true| RAG
+    ROUTER -->|planning = true| PARSER
+    ROUTER -->|planning = true| LOADER
+
+    subgraph PREP["Parallel preparation — CPU and local I/O"]
+        direction LR
+        RAG["Hybrid retrieval<br/>BM25 + dense fusion"] --> RERANK["CPU cross-encoder reranker"]
+        RERANK --> PASSAGES["Relevant cited passages"]
+        PARSER["Constraint parser — local Kimi"] --> VALIDATE["Validate explicit constraints"]
+        LOADER["Planning data loader — Excel"] --> MODELS["Workers, tasks, machines,<br/>vehicles and calendars"]
+    end
+
+    PASSAGES -->|rag only| RAGANSWER["Evidence-grounded answer — local Kimi"]
+    VALIDATE --> SOLVER["OR-Tools CP-SAT scheduler — CPU"]
+    MODELS --> SOLVER
+    PASSAGES -. rag + planning .-> EXPLAIN
+    SOLVER --> DRAFT["Save immutable draft + audit event — SQLite"]
+    DRAFT --> EXPLAIN["Schedule explanation — local Kimi"]
+
+    GENERAL --> COMPOSE["Structured response composer"]
+    RAGANSWER --> COMPOSE
+    EXPLAIN --> COMPOSE
+    COMPOSE --> META["Answer · sources · warnings<br/>solver status · timing · approval status"]
+    META --> UIRESULT["React result view"]
+    UIRESULT --> U
+
+    U -->|review draft later| REVIEW["Human review lifecycle"]
+    REVIEW -->|approve| APPROVE["Set status: approved + audit event"]
+    REVIEW -->|reject + comment| REJECT["Set status: rejected + audit event"]
+    APPROVE --> REVIEWRESULT["Updated approval response"]
+    REJECT --> REVIEWRESULT
+    REVIEWRESULT --> UIRESULT
+    REJECT -. new request if changes are needed .-> UI
 ```
+
+Draft creation and human review are deliberately separate. The user receives
+the schedule immediately with `approval_status: draft`; a later review request
+changes only its status and audit history. Rejection does not silently modify or
+rerun a schedule—the user submits a new planning request with revised constraints.
 
 The intent router returns non-exclusive flags. A request can use RAG and
 planning together:
@@ -73,8 +105,8 @@ context to 8K tokens to leave GPU memory for the context cache and application.
 ## 1. Install the application
 
 ```powershell
-git clone https://github.com/Kygosaur/PlanningAI-Kimi.git
-cd PlanningAI-Kimi
+git clone https://github.com/Kygosaur/OpsPlanning-AI-KimiOnly.git
+cd OpsPlanning-AI-KimiOnly
 
 python -m venv .venv
 .venv\Scripts\Activate.ps1
