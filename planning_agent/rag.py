@@ -148,8 +148,10 @@ class WorkspaceIndex:
             from fastembed.rerank.cross_encoder import TextCrossEncoder
 
             local_only = os.getenv("RETRIEVAL_LOCAL_FILES_ONLY", "true").casefold() == "true"
-            self._embedding_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5", local_files_only=local_only)
-            self._reranker = TextCrossEncoder(model_name="Xenova/ms-marco-MiniLM-L-6-v2", local_files_only=local_only)
+            cpu_threads = max(1, int(os.getenv("RETRIEVAL_CPU_THREADS", "2")))
+            cpu_runtime = {"providers": ["CPUExecutionProvider"], "cuda": False, "threads": cpu_threads}
+            self._embedding_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5", local_files_only=local_only, **cpu_runtime)
+            self._reranker = TextCrossEncoder(model_name="Xenova/ms-marco-MiniLM-L-6-v2", local_files_only=local_only, **cpu_runtime)
             matrix = np.asarray(list(self._embedding_model.passage_embed([chunk.retrieval_text for chunk in self._chunks])), dtype=np.float32)
             norms = np.linalg.norm(matrix, axis=1, keepdims=True)
             self._dense_matrix = matrix / np.maximum(norms, 1e-12)

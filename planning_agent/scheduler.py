@@ -17,7 +17,8 @@ MINUTES_PER_HOUR = 60
 @dataclass(frozen=True)
 class OptimizationOptions:
     max_time_seconds: float = 30.0
-    num_search_workers: int = max(1, min(os.cpu_count() or 1, 8))
+    # Leave CPU capacity for Kimi support services, retrieval, and the desktop.
+    num_search_workers: int = max(1, min(int(os.getenv("ORTOOLS_SEARCH_WORKERS", "4")), os.cpu_count() or 1))
     random_seed: int = 42
 
 

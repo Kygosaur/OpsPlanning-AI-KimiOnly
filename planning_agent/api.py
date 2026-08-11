@@ -219,26 +219,38 @@ async def _event_stream(request: ChatRequest, principal: Principal) -> AsyncIter
         yield _sse("intent", intents.to_dict())
 
         passages: list[Passage] = []
-        if intents.rag:
-            yield _sse("status", {"stage": "searching", "message": "Searching approved local files"})
-            mark = time.perf_counter()
-            passages = await asyncio.to_thread(state.index.search, request.question, 5, 0.04)  # type: ignore[union-attr]
-            timings["retrieval_seconds"] = round(time.perf_counter() - mark, 3)
-            yield _sse("sources", {"items": [source_payload(p) for p in passages]})
-
         schedule = None
         schedule_id = None
+        workbook = None
         if intents.planning:
             if principal.role not in {"admin", "planner"}:
                 raise PermissionError("Planning requires the planner or admin role.")
             workbook = Path(os.getenv("PLANNING_WORKBOOK", "data/planning.xlsx")).resolve()
             if not workbook.is_file():
                 raise FileNotFoundError(f"Planning workbook not found: {workbook.name}")
-            yield _sse("status", {"stage": "parsing", "message": "Parsing planning constraints"})
-            mark = time.perf_counter()
-            parsed = await asyncio.to_thread(understand_request, state.client, request.question)  # type: ignore[arg-type]
-            workers, tasks, machines, vehicles = await asyncio.to_thread(load_workbook, workbook)
-            timings["constraint_parser_seconds"] = round(time.perf_counter() - mark, 3)
+
+        # Once routing is known these jobs are independent: semantic retrieval
+        # uses CPU, constraint parsing uses local Kimi, and Excel loading is I/O.
+        # Running them together reduces latency without adding GPU workloads.
+        preparation_started = time.perf_counter()
+        preparation: dict[str, asyncio.Task] = {}
+        if intents.rag:
+            yield _sse("status", {"stage": "preparing", "message": "Searching files and preparing the plan in parallel" if intents.planning else "Searching approved local files"})
+            preparation["retrieval"] = asyncio.create_task(_timed_to_thread(state.index.search, request.question, 5, 0.04))  # type: ignore[union-attr]
+        if intents.planning:
+            if not intents.rag:
+                yield _sse("status", {"stage": "parsing", "message": "Parsing planning constraints"})
+            preparation["constraints"] = asyncio.create_task(_timed_to_thread(understand_request, state.client, request.question))  # type: ignore[arg-type]
+            preparation["workbook"] = asyncio.create_task(_timed_to_thread(load_workbook, workbook))
+        prepared = dict(zip(preparation, await asyncio.gather(*preparation.values()))) if preparation else {}
+        timings["parallel_preparation_seconds"] = round(time.perf_counter() - preparation_started, 3)
+
+        if intents.rag:
+            passages, timings["retrieval_seconds"] = prepared["retrieval"]
+            yield _sse("sources", {"items": [source_payload(p) for p in passages]})
+        if intents.planning:
+            parsed, timings["constraint_parser_seconds"] = prepared["constraints"]
+            (workers, tasks, machines, vehicles), timings["workbook_load_seconds"] = prepared["workbook"]
             yield _sse("status", {"stage": "optimizing", "message": "Optimizing the draft schedule"})
             mark = time.perf_counter()
             schedule = await asyncio.to_thread(create_schedule, workers, tasks, machines, vehicles, parsed)
@@ -277,6 +289,12 @@ async def _event_stream(request: ChatRequest, principal: Principal) -> AsyncIter
         yield _sse("complete", response)
     except Exception as error:
         yield _sse("error", {"message": str(error), "elapsed_seconds": round(time.perf_counter() - started, 2)})
+
+
+async def _timed_to_thread(function, *args):
+    started = time.perf_counter()
+    result = await asyncio.to_thread(function, *args)
+    return result, round(time.perf_counter() - started, 3)
 
 
 def _sse(event: str, data: dict[str, object]) -> str:

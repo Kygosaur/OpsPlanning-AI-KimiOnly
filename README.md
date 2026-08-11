@@ -93,6 +93,14 @@ Normal use is then offline. Retrieval combines BM25 lexical matching and local
 embedding similarity, fuses candidates, and reranks them with a local cross
 encoder. Set `RETRIEVAL_ENABLE_SEMANTIC=false` for lexical-only operation.
 
+For combined requests, document retrieval, constraint parsing, and workbook
+loading run concurrently after intent routing. Retrieval and reranking are
+explicitly pinned to CPU; OR-Tools is CPU-only and defaults to four search
+workers. Only Kimi/Ollama uses the NVIDIA GPU. The included 8K Kimi context
+profile and these conservative CPU defaults leave capacity for normal desktop
+work. Adjust `RETRIEVAL_CPU_THREADS` and `ORTOOLS_SEARCH_WORKERS` in `.env` if
+the machine has more or less spare CPU capacity.
+
 Build the React interface:
 
 ```powershell
