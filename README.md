@@ -219,6 +219,25 @@ automobile/vehicle, and PPE/personal protective equipment.
 
 ## 4. Start the web application
 
+### One-click Windows shortcut
+
+Run this once to create a **PlanningAI** shortcut on the current user's Desktop:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\create_desktop_shortcut.ps1
+```
+
+After that, double-click **PlanningAI**. The launcher checks Ollama and the
+`planning-kimi` model, starts the private FastAPI service in the background,
+waits until document indexing is ready, and opens the chat automatically. If
+startup fails, it displays a readable error and records diagnostic logs under
+`data\`.
+
+The shortcut uses `assets\planning-ai.ico`. Re-run the shortcut creation script
+after moving the repository to another folder or computer.
+
+### PowerShell startup
+
 From the repository folder:
 
 ```powershell
